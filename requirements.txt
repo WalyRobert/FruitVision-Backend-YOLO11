@@ -1,0 +1,40 @@
+# Core Dependencies
+fastapi==0.104.1
+uvicorn==0.24.0
+python-websockets==13.0
+python-multipart==0.0.6
+cors==1.0.1
+
+# Computer Vision - YOLO11
+ultralytics==8.0.228
+opencv-python==4.8.1.78
+opencv-contrib-python==4.8.1.78
+
+# Segmentation - Meta SAM 3D
+torch==2.1.1
+torchvision==0.16.1
+segment-anything==1.0
+
+# Additional Vision Libraries
+numpy==1.24.3
+scipy==1.11.4
+pillow==10.1.0
+
+# Data Processing
+pandas==2.1.3
+
+# Video Processing
+ffmpeg-python==0.2.1
+
+# Async & WebSocket
+aiofiles==23.2.1
+websockets==13.0
+
+# Deployment & Utilities
+pydantic==2.5.0
+python-dotenv==1.0.0
+loguru==0.7.2
+pytest==7.4.3
+
+# GPU Support (Optional - for NVIDIA CUDA)
+torch-cuda==11.8
