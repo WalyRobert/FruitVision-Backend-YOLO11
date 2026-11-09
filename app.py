@@ -1,223 +1,286 @@
-#!/usr/bin/env python3
-"""
-FruitVision Backend API
-FastAPI application with YOLO11 object detection,
-ObjectCounter tracking, SAM 3D segmentation,
-and WebSocket streaming support.
-"""
+"""FruitVision: API local de detecção e segmentação 2D, com demonstração explícita."""
 
-import os
-import io
-from pathlib import Path
-from typing import Optional
 import asyncio
+import base64
+import binascii
+import hmac
 import json
-
-from fastapi import FastAPI, File, UploadFile, WebSocket, HTTPException
+import logging
+import os
+import re
+from contextlib import asynccontextmanager
+from pathlib import Path
+from time import time
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    HTTPException,
+    Depends,
+    Header,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-import cv2
-import numpy as np
-from ultralytics import YOLO
-from ultralytics.solutions import ObjectCounter
-
-from models import DetectionResponse, VideoProcessingResponse, SegmentationResponse
-from detector import YOLODetector
-from segmenter import SAM3DSegmenter
+from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
+from detector import YOLODetector, DemoDetector, ModelUnavailable
+from segmenter import YOLOSegmenter, DemoSegmenter
 from websocket_manager import ConnectionManager
+from media import decode_image, bounded_read
+from video import process_video_bytes
+from models import DetectionResponse, SegmentationResponse, VideoProcessingResponse
+from upload_limit import UploadLimitMiddleware
+from starlette.websockets import WebSocketState
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="FruitVision Backend API",
-    description="Real-time fruit detection, tracking, and segmentation",
-    version="1.0.0"
-)
+logger = logging.getLogger(__name__)
 
-# CORS middleware
-# Configure the exact frontend origins in FRUITVISION_CORS_ORIGINS.
-# Default to local development only; never use a wildcard in production.
-cors_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "FRUITVISION_CORS_ORIGINS",
-        "http://localhost:3000,http://localhost:5173"
-    ).split(",")
-    if origin.strip()
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
-)
 
-# Global managers and detectors
-manager = ConnectionManager()
-detector: Optional[YOLODetector] = None
-segmenter: Optional[SAM3DSegmenter] = None
+def create_app(detector=None, segmenter=None, output_dir=None):
+    mode = os.getenv("FRUITVISION_MODE", "demo")
+    if mode not in ("demo", "yolo"):
+        raise ValueError("FRUITVISION_MODE deve ser demo ou yolo.")
+    classes = [
+        x.strip()
+        for x in os.getenv("FRUIT_CLASSES", "apple,banana,orange").split(",")
+        if x.strip()
+    ]
+    detect_engine = (
+        detector
+        if detector is not None
+        else (
+            DemoDetector()
+            if mode == "demo"
+            else YOLODetector(os.getenv("YOLO_MODEL", "models/yolo11n.pt"), classes)
+        )
+    )
+    segment_engine = (
+        segmenter
+        if segmenter is not None
+        else (
+            DemoSegmenter()
+            if mode == "demo"
+            else YOLOSegmenter(
+                os.getenv("YOLO_SEGMENT_MODEL", "models/yolo11n-seg.pt"), classes
+            )
+        )
+    )
+    output = Path(output_dir or os.getenv("OUTPUT_DIR", "data/outputs")).resolve()
+    upload_limit = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
+    max_pixels = int(os.getenv("MAX_IMAGE_PIXELS", "12000000"))
+    max_outputs = int(os.getenv("MAX_OUTPUT_FILES", "20"))
+    key = os.getenv("FRUITVISION_API_KEY", "")
+    origins = [
+        s.strip()
+        for s in os.getenv("ALLOWED_ORIGINS", os.getenv("FRUITVISION_CORS_ORIGINS", "http://127.0.0.1:5173")).split(",")
+        if s.strip()
+    ]
+    gate = asyncio.Lock()
+    manager = ConnectionManager()
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize ML models on startup"""
-    global detector, segmenter
-    print("[STARTUP] Loading YOLO11 detector...")
-    detector = YOLODetector(model_name="yolo11n")
-    
-    print("[STARTUP] Loading SAM 3D segmenter...")
-    segmenter = SAM3DSegmenter()
-    
-    print("[STARTUP] Models loaded successfully!")
+    @asynccontextmanager
+    async def lifespan(app):
+        output.mkdir(parents=True, exist_ok=True)
+        yield
+        detect_engine.cleanup()
+        segment_engine.cleanup()
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    print("[SHUTDOWN] Cleaning up resources...")
-    if detector:
-        detector.cleanup()
-    if segmenter:
-        segmenter.cleanup()
+    api = FastAPI(title="FruitVision", version="0.2.0", lifespan=lifespan)
+    api.add_middleware(UploadLimitMiddleware, max_bytes=upload_limit + 65536)
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Key"],
+    )
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "detector_loaded": detector is not None,
-        "segmenter_loaded": segmenter is not None
-    }
+    async def authorize(x_api_key: str | None = Header(default=None)):
+        if key and not hmac.compare_digest(x_api_key or "", key):
+            raise HTTPException(401, "Chave de acesso inválida.")
 
-@app.post("/detect", response_model=DetectionResponse)
-async def detect_fruits(file: UploadFile = File(...)):
-    """Detect fruits in a single image"""
-    if not detector:
-        raise HTTPException(status_code=503, detail="Detector not loaded")
-    
-    try:
-        # Read image
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Run detection
-        results = detector.detect(image)
-        
+    async def run_job(function, *args):
+        if gate.locked():
+            raise HTTPException(
+                429,
+                "Processamento ocupado. Tente novamente após concluir a tarefa atual.",
+            )
+        async with gate:
+            try:
+                return await run_in_threadpool(function, *args)
+            except ModelUnavailable as exc:
+                raise HTTPException(503, str(exc)) from exc
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.exception("Falha de processamento")
+                raise HTTPException(
+                    500, "Falha de processamento. Consulte os logs do servidor."
+                ) from exc
+
+    @api.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "mode": mode,
+            "inference_enabled": mode == "yolo",
+            "detector_loaded": getattr(detect_engine, "model", None) is not None,
+            "segmenter_loaded": getattr(segment_engine, "model", None) is not None,
+            "segmentation": "demo" if mode == "demo" else "yolo-2d",
+            "authentication_required": bool(key),
+        }
+
+    def image_job(data, segment=False):
+        image = decode_image(data, max_pixels)
+        if segment:
+            result = segment_engine.segment(image)
+            return SegmentationResponse(
+                mode=mode,
+                engine="demo" if mode == "demo" else "yolo-2d",
+                polygons=result["polygons"],
+                num_objects=result["num_objects"],
+                processing_time_ms=result["processing_time"],
+            )
+        result = detect_engine.detect(image)
         return DetectionResponse(
-            success=True,
-            detections=results["detections"],
+            mode=mode,
+            detections=result["detections"],
             image_shape=(image.shape[1], image.shape[0]),
-            processing_time_ms=results["processing_time"]
+            processing_time_ms=result["processing_time"],
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/segment", response_model=SegmentationResponse)
-async def segment_fruits(file: UploadFile = File(...)):
-    """Segment fruits in an image using SAM 3D"""
-    if not segmenter:
-        raise HTTPException(status_code=503, detail="Segmenter not loaded")
-    
-    try:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Run segmentation
-        results = segmenter.segment(image)
-        
-        return SegmentationResponse(
-            success=True,
-            masks=results["masks"],
-            num_objects=results["num_objects"],
-            processing_time_ms=results["processing_time"]
+    @api.post(
+        "/detect", response_model=DetectionResponse, dependencies=[Depends(authorize)]
+    )
+    async def detect(file: UploadFile = File(...)):
+        return await run_job(image_job, await bounded_read(file, upload_limit))
+
+    @api.post(
+        "/segment",
+        response_model=SegmentationResponse,
+        dependencies=[Depends(authorize)],
+    )
+    async def segment(file: UploadFile = File(...)):
+        return await run_job(image_job, await bounded_read(file, upload_limit), True)
+
+    def video_job(data, enabled):
+        output.mkdir(parents=True, exist_ok=True)
+        for old in output.glob("*.mp4"):
+            if time() - old.stat().st_mtime > 3600:
+                old.unlink(missing_ok=True)
+        if len(list(output.glob("*.mp4"))) >= max_outputs:
+            raise HTTPException(
+                507, "Armazenamento temporário cheio. Aguarde a expiração dos arquivos."
+            )
+        result = process_video_bytes(
+            data,
+            detect_engine,
+            segment_engine,
+            output,
+            enabled,
+            int(os.getenv("MAX_VIDEO_FRAMES", "300")),
+            float(os.getenv("MAX_VIDEO_SECONDS", "30")),
+            max_pixels,
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return VideoProcessingResponse(mode=mode, **result)
 
-@app.post("/process-video", response_model=VideoProcessingResponse)
-async def process_video(file: UploadFile = File(...), enable_segmentation: bool = False):
-    """Process a video file with YOLO detection and optional SAM 3D segmentation"""
-    if not detector:
-        raise HTTPException(status_code=503, detail="Detector not loaded")
-    
-    try:
-        # Save uploaded file
-        temp_path = f"temp_{file.filename}"
-        with open(temp_path, "wb") as f:
-            f.write(await file.read())
-        
-        # Process video
-        output_path = f"output_{file.filename}"
-        
-        cap = cv2.VideoCapture(temp_path)
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        counter = ObjectCounter()
-        frame_count = 0
-        detections_list = []
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Detection
-            results = detector.detect(frame)
-            detections_list.extend(results["detections"])
-            
-            frame_count += 1
-        
-        cap.release()
-        out.release()
-        
-        os.remove(temp_path)
-        
-        return VideoProcessingResponse(
-            success=True,
-            output_file=output_path,
-            total_frames=frame_count,
-            total_detections=len(detections_list),
-            fps=fps,
-            resolution=(width, height)
+    @api.post(
+        "/process-video",
+        response_model=VideoProcessingResponse,
+        dependencies=[Depends(authorize)],
+    )
+    async def process_video(
+        file: UploadFile = File(...), enable_segmentation: bool = Form(False)
+    ):
+        return await run_job(
+            video_job, await bounded_read(file, upload_limit), enable_segmentation
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time video streaming"""
-    await manager.connect(websocket)
-    try:
-        while True:
-            data = await websocket.receive_json()
-            
-            if data["type"] == "frame":
-                # Decode frame
-                frame_data = data["frame"]
-                nparr = np.frombuffer(bytes.fromhex(frame_data), np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                # Run detection
-                results = detector.detect(frame)
-                
-                # Send back results
-                response = {
-                    "type": "detection_results",
-                    "detections": results["detections"],
-                    "processing_time_ms": results["processing_time"]
-                }
-                
-                await websocket.send_json(response)
-    
-    except Exception as e:
-        await manager.disconnect(websocket)
-        print(f"WebSocket error: {e}")
+    @api.get("/videos/{video_id}", dependencies=[Depends(authorize)])
+    async def download(video_id: str):
+        if not re.fullmatch("[a-f0-9]{32}", video_id):
+            raise HTTPException(404, "Vídeo não encontrado.")
+        path = output / (video_id + ".mp4")
+        if not path.is_file() or time() - path.stat().st_mtime > 3600:
+            raise HTTPException(404, "Vídeo ausente ou expirado.")
+        return FileResponse(path, media_type="video/mp4", filename=path.name)
 
+    @api.websocket("/ws")
+    async def websocket(ws: WebSocket):
+        origin = ws.headers.get("origin")
+        if origin and origin not in origins:
+            await ws.close(code=1008)
+            return
+        if key and not hmac.compare_digest(ws.headers.get("x-api-key", ""), key):
+            # Clientes de navegador podem usar a primeira mensagem para autenticar.
+            await ws.accept()
+            try:
+                auth = await asyncio.wait_for(ws.receive_text(), timeout=5)
+                credentials = json.loads(auth) if len(auth) <= 4096 else None
+                if (
+                    not isinstance(credentials, dict)
+                    or not isinstance(credentials.get("api_key"), str)
+                    or not hmac.compare_digest(credentials["api_key"], key)
+                ):
+                    await ws.close(code=1008)
+                    return
+            except (ValueError, asyncio.TimeoutError, WebSocketDisconnect):
+                await ws.close(code=1008)
+                return
+            if len(manager.active) >= manager.max_connections:
+                await ws.close(code=1013)
+                return
+            manager.active.add(ws)
+        elif not await manager.connect(ws):
+            return
+        try:
+            await ws.send_json({"type": "ready", "mode": mode})
+            while True:
+                raw = await asyncio.wait_for(ws.receive_text(), timeout=30)
+                if len(raw) > 2_000_000:
+                    await ws.close(code=1009)
+                    return
+                try:
+                    packet = json.loads(raw)
+                    if (
+                        not isinstance(packet, dict)
+                        or packet.get("type") != "frame"
+                        or not isinstance(packet.get("frame"), str)
+                    ):
+                        raise ValueError(
+                            "Use type=frame e frame com bytes codificados."
+                        )
+                    data = (
+                        base64.b64decode(packet["frame"], validate=True)
+                        if packet.get("encoding") == "base64"
+                        else bytes.fromhex(packet["frame"])
+                    )
+                    result = await run_job(image_job, data)
+                    await ws.send_json(
+                        {"type": "detection_results", **result.model_dump()}
+                    )
+                except (ValueError, binascii.Error, HTTPException) as exc:
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "error": exc.detail
+                            if isinstance(exc, HTTPException)
+                            else "Mensagem ou frame inválido.",
+                        }
+                    )
+        except (WebSocketDisconnect, asyncio.TimeoutError):
+            pass
+        finally:
+            manager.disconnect(ws)
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.close()
+
+    return api
+
+
+app = create_app()
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, ws_max_size=2_000_000)
