@@ -34,12 +34,22 @@ app = FastAPI(
 )
 
 # CORS middleware
+# Configure the exact frontend origins in FRUITVISION_CORS_ORIGINS.
+# Default to local development only; never use a wildcard in production.
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRUITVISION_CORS_ORIGINS",
+        "http://localhost:3000,http://localhost:5173"
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # Global managers and detectors
