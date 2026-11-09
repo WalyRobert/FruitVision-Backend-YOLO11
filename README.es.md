@@ -1,3 +1,5 @@
+[Português](README.md) · [Español](README.es.md)
+
 # FruitVision — Backend de visión artificial
 
 **Idioma:** Español  
