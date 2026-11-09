@@ -1,0 +1,4 @@
+-r requirements.txt
+ultralytics==8.4.208
+# PyTorch/CUDA: instale a distribuição adequada pelo guia oficial antes deste arquivo.
+# OpenCV padrão transitivo do Ultralytics: escolha uma única variante em produção.

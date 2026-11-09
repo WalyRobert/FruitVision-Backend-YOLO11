@@ -1,93 +1,84 @@
-[Português](README.md) · [Español](README.es.md)
+# FruitVision — API de visão computacional
 
-# FruitVision — Backend de visão computacional
+API FastAPI para imagens, vídeos curtos e frames por WebSocket. A estrutura agora inclui os módulos importados, validação de entrada, gravação de vídeos e testes. **Modo padrão: demo, sem inferência de IA.** Nesse modo os resultados de detecção e segmentação são vazios e a resposta informa `mode=demo`.
 
-**Idioma:** Português (Brasil)  
-**Status:** Protótipo experimental. A API está iniciada, mas a estrutura atual precisa de módulos e validações antes de ser considerada executável.
+## Instalar e iniciar
 
-FruitVision é um projeto experimental de backend para análise de imagens e vídeos com visão computacional. A proposta é explorar detecção de objetos, contagem/rastreamento e segmentação, com uma API que possa atender a uma interface web.
+Python 3.12 recomendado. Windows PowerShell:
 
-## Objetivo
-
-- Receber imagens para detecção.
-- Receber imagens para segmentação.
-- Processar vídeos.
-- Disponibilizar resultados por HTTP e WebSocket.
-- Evoluir para integração com uma interface React.
-
-## Tecnologias identificadas
-
-- Python
-- FastAPI e Uvicorn
-- OpenCV e NumPy
-- Ultralytics / YOLO
-- WebSocket
-- PyTorch e bibliotecas de visão computacional listadas em `requirements.txt`
-
-As dependências listadas representam a configuração pretendida e ainda precisam ser validadas em ambiente limpo e compatível.
-
-## Endpoints presentes em `app.py`
-
-| Método | Rota | Finalidade descrita |
-|---|---|---|
-| GET | `/health` | Verificar o estado do serviço |
-| POST | `/detect` | Receber imagem para detecção |
-| POST | `/segment` | Receber imagem para segmentação |
-| POST | `/process-video` | Iniciar processamento de vídeo |
-| WebSocket | `/ws` | Receber frames e devolver resultados de detecção |
-
-## Módulos referenciados
-
-O arquivo principal importa:
-
-- `models`: modelos de resposta da API.
-- `detector`: encapsulamento da detecção YOLO.
-- `segmenter`: encapsulamento da segmentação.
-- `websocket_manager`: gerenciamento de conexões WebSocket.
-
-**Pendência de reprodutibilidade:** esses módulos importados não foram localizados na revisão do conteúdo atual do repositório. A aplicação pode falhar ao iniciar até que os arquivos sejam adicionados ou as importações sejam corrigidas.
-
-## Instalação pretendida
-
-```bash
-git clone https://github.com/WalyRobert/FruitVision-Backend-YOLO11.git
-cd FruitVision-Backend-YOLO11
+```powershell
 python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe app.py
 ```
 
-Ative o ambiente virtual e revise a compatibilidade das dependências antes de instalar:
+Abra **http://127.0.0.1:8000/docs** para a interface da API e **/health** para o estado do serviço. Linux/macOS: substitua `.venv\Scripts\python.exe` por `.venv/bin/python`.
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+## Ativar YOLO real
+
+1. Instale a distribuição PyTorch adequada a CPU/GPU pelo [guia oficial](https://pytorch.org/get-started/locally/).
+2. Instale `requirements-ml.txt`. Ultralytics requer OpenCV padrão; use somente uma variante OpenCV por ambiente. Se necessário, remova `opencv-python-headless` após instalar a variante padrão.
+3. Obtenha pesos confiáveis compatíveis com YOLO11 e salve-os localmente; `yolo11n.pt` para detecção, `yolo11n-seg.pt` para segmentação 2D. O servidor não baixa pesos implicitamente.
+4. Configure variáveis e inicie:
+
+```powershell
+$env:FRUITVISION_MODE="yolo"
+$env:YOLO_MODEL="C:\modelos\yolo11n.pt"
+$env:YOLO_SEGMENT_MODEL="C:\modelos\yolo11n-seg.pt"
+.venv\Scripts\python.exe app.py
+```
+
+O carregamento é sob demanda. Pesos ausentes resultam em HTTP 503; `/health` distingue modo e modelos carregados. Os testes desta entrega não carregaram pesos reais nem mediram precisão, FPS ou GPU. A configuração `.env.example` é uma referência: exporte as variáveis no terminal; o arquivo `.env` não é carregado automaticamente.
+
+As classes padrão são `apple,banana,orange`. Configure `FRUIT_CLASSES` com os nomes das classes do seu modelo. Detectar outras frutas exige pesos treinados para essas classes. Modelos COCO não equivalem a um detector validado para toda produção agrícola.
+
+## Rotas
+
+| Rota | Uso |
+| --- | --- |
+| `GET /health` | Modo, autenticação exigida e estado dos modelos |
+| `POST /detect` | Multipart `file`; caixas, classes e confiança |
+| `POST /segment` | Multipart `file`; polígonos de segmentação 2D |
+| `POST /process-video` | Multipart `file` e `enable_segmentation=true/false`; metadados e URL de download |
+| `GET /videos/{id}` | Download do MP4 gerado, disponível por até 1 hora |
+| `WS /ws` | Frames hex ou base64; resultados por frame |
+
+Exemplo com curl:
 
 ```bash
-pip install -r requirements.txt
+curl -F "file=@foto.png" http://127.0.0.1:8000/detect
+curl -F "file=@trecho.mp4" -F "enable_segmentation=true" http://127.0.0.1:8000/process-video
 ```
 
-O comando de inicialização pretendido é:
+O vídeo é gravado frame a frame, com caixas e polígonos quando disponíveis. O contêiner é MP4 com codec `mp4v`; reprodução em navegadores depende dos codecs disponíveis e pode exigir transcodificação. Áudio não é preservado. `total_detections` soma detecções por frame; **não representa frutas únicas rastreadas ou contagem por cruzamento de linha**. Não há implementação SAM 3D, reconstrução 3D ou rastreamento ObjectCounter nesta versão. A segmentação disponível usa YOLO 2D e é identificada na resposta.
 
-```bash
-uvicorn app:app --reload
-```
+## Limites e operação
 
-**Atenção:** a execução ainda não foi validada e pode falhar devido aos módulos ausentes ou a incompatibilidades de dependências.
+- Upload padrão: 25 MB, limitado também antes do armazenamento multipart.
+- Imagem/frame: até 12 milhões de pixels; imagens são verificadas antes da decodificação OpenCV.
+- Vídeo: até 300 frames, 30 segundos de duração e verificação do tempo entre frames. O prazo não interrompe uma inferência individual em andamento.
+- Um processamento por instância; concorrência retorna HTTP 429. O trabalho pesado roda em thread, preservando o atendimento de `/health`.
+- Nomes de arquivos são UUIDs, independentes do nome recebido. Temporários e saídas parciais são removidos nas falhas.
+- Saídas ficam em `data/outputs/`, com limite de 20 arquivos. A remoção de arquivos expirados ocorre ao iniciar novo processamento de vídeo.
+- CORS usa lista explícita em `ALLOWED_ORIGINS`. Defina `FRUITVISION_API_KEY` e envie `X-API-Key` para as rotas de processamento/download quando compartilhar o serviço.
+- O servidor padrão escuta apenas `127.0.0.1`. A API é local; exposição externa exige proxy com limite de corpo, autenticação e controle de recursos. Para volumes maiores, substitua o processamento síncrono da requisição por uma fila de tarefas.
 
-## Pendências técnicas identificadas
+## WebSocket
 
-- [ ] Adicionar ou corrigir os módulos `models`, `detector`, `segmenter` e `websocket_manager`.
-- [ ] Validar dependências em ambiente limpo, incluindo PyTorch, OpenCV e Ultralytics.
-- [ ] Validar imagens recebidas e rejeitar arquivos inválidos.
-- [ ] Definir limites de tamanho e tempo para uploads e processamento.
-- [ ] Restringir CORS às origens necessárias.
-- [ ] Gerar nomes seguros para arquivos temporários e garantir limpeza em caso de falha.
-- [ ] Completar gravação e disponibilização do vídeo processado.
-- [ ] Tratar desconexões e erros no WebSocket.
-- [ ] Adicionar testes automatizados para endpoints e processamento.
-- [ ] Documentar modelos, licenças, hardware e métricas de desempenho.
+Envie `{"type":"frame","frame":"<hex dos bytes da imagem>"}` ou acrescente `"encoding":"base64"` para base64. O servidor responde primeiro `type=ready`, depois `type=detection_results` ou `type=error`. O limite de mensagem é 2 MB e o timeout entre mensagens é 30 segundos.
 
-## Segurança
+Quando há chave, clientes que não conseguem definir headers devem enviar primeiro `{"api_key":"sua-chave"}`. Não coloque a chave na URL. Para navegador, a origem também deve estar em `ALLOWED_ORIGINS`.
 
-A configuração atual de CORS é ampla e deve ser restringida antes de disponibilizar o serviço. O backend também precisa de validação de entradas, limites de recursos e gestão segura de arquivos antes de receber dados de usuários.
+## Evidências de teste
 
-## Autor
+Os testes usam detectores controlados para verificar os contratos da API; o modo demo retorna listas vazias. Há testes de imagem inválida, upload excessivo, origem/credencial, WebSocket, concorrência, falta de pesos e vídeo. O teste de vídeo cria um AVI curto, processa, baixa o MP4 e decodifica seus frames. Isso comprova a tubulação de mídia, não a qualidade dos modelos de IA.
 
-Waly Robert
+Referências: [detecção Ultralytics](https://docs.ultralytics.com/tasks/detect/), [segmentação Ultralytics](https://docs.ultralytics.com/tasks/segment/).
 
-Projeto independente de estudo e experimentação em visão computacional aplicada.
+Autor: Waly Robert.
+
+Para reproduzir exatamente as dependências de teste desta entrega, instale requirements-test-lock.txt. O CI usa esse arquivo; a instalação opcional de ML não foi incluída nesse lock.
