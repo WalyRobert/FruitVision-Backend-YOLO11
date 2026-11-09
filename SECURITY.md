@@ -1,22 +1,9 @@
-# Security Policy
+# Segurança
 
-## Deployment status
+API experimental para execução local. O servidor padrão escuta somente em `127.0.0.1`. Para qualquer acesso compartilhado, configure `FRUITVISION_API_KEY`, origem explícita, proxy com limites, TLS e controle de recursos. CORS não substitui autenticação.
 
-FruitVision is an experimental backend. The current HTTP endpoints and WebSocket endpoint do not implement authentication or authorization. **Do not expose this service to the public internet or use it with private/user data until access control and resource protections are implemented and tested.**
+Uploads têm limites de corpo, duração e pixels; arquivos e saídas usam nomes gerados pelo servidor e expiram. Esses controles não constituem sandbox de codecs ou modelos hostis. Use arquivos autorizados, pesos confiáveis e navegador/dependências atualizados.
 
-## Current safeguards and limitations
+Não publique chaves, arquivos pessoais, pesos privados ou saídas reais. Exemplos de configuração contêm campos vazios. O modo demo não realiza inferência nem inventa detecções. Detecção e segmentação 2D não certificam qualidade industrial ou segurança de alimentos.
 
-- CORS is restricted to the local development origins by default. Set `FRUITVISION_CORS_ORIGINS` to a comma-separated allowlist of exact trusted frontend origins for a controlled deployment.
-- CORS is not authentication. It does not prevent direct requests from scripts, servers, or command-line clients.
-- Upload size/type validation, safe temporary-file handling, rate limiting, WebSocket access control, and request/resource quotas still require implementation and tests.
-- Keep the service behind a trusted network boundary until those controls exist. Use HTTPS at the deployment boundary.
-
-## Secrets and personal data
-
-- Never commit API keys, passwords, tokens, private keys, credentials, or personal data.
-- Do not upload private images/videos or personal data to an untrusted deployment.
-- If a real credential is exposed, revoke/rotate it with its provider. Removing it from the latest commit does not remove it from Git history or existing clones.
-
-## Reporting
-
-Do not publish secrets or personal information in issues. Report security concerns privately to the repository owner.
+Relate problemas com mídia sintética mínima, sem credenciais em issues públicas. Dependências/modelos mantêm suas próprias licenças; esta alteração não atribui nova licença ao código do projeto.
