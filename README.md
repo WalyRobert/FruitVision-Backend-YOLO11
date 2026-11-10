@@ -82,3 +82,8 @@ Referências: [detecção Ultralytics](https://docs.ultralytics.com/tasks/detect
 Autor: Waly Robert.
 
 Para reproduzir exatamente as dependências de teste desta entrega, instale requirements-test-lock.txt. O CI usa esse arquivo; a instalação opcional de ML não foi incluída nesse lock.
+
+## Diagnóstico local
+
+Execute python diagnostico.py no ambiente virtual para conferir dependências e presença dos pesos exigidos pelo modo YOLO, sem baixar modelos, consumir serviços externos ou mostrar credenciais. Presença do arquivo não comprova que o modelo carrega nem sua precisão.
+
